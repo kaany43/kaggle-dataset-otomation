@@ -1,260 +1,190 @@
-"""
-auto.py — Trendyol Süper Lig Otonom Dataset Sistemi
-════════════════════════════════════════════════════
-
-Her çalıştığında:
-  1. Sofascore'dan güncel veri çeker
-  2. CSV'leri ./data/<sezon>/ klasörüne yazar
-  3. Kaggle'a yükler (isteğe bağlı)
-  4. Çalışma logunu kaydeder
-
-Kullanım:
-  python auto.py                         # mevcut sezon, Kaggle'a YÜKLEMEz
-  python auto.py --upload                # mevcut sezon + Kaggle yükle
-  python auto.py --season 2024           # 2024 sezonu
-  python auto.py --season 61627          # sezon ID ile
-  python auto.py --modules matches events # sadece bu modüller
-  python auto.py --upload --new          # ilk kez yükleme (yeni dataset)
-
-Otomatik çalıştırma:
-  Windows Task Scheduler:
-    Tetikleyici : Günlük 03:00
-    Eylem       : python C:\\proje\\auto.py --upload
-
-  Linux cron:
-    0 3 * * * cd /proje && .venv/bin/python auto.py --upload >> logs/cron.log 2>&1
-"""
-
-import sys
-import asyncio
-
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-import os
-import json
-import logging
 import argparse
-import datetime
-from dotenv import load_dotenv, find_dotenv
+import asyncio
+import logging
+import os
+from datetime import datetime, timezone
 
-# ─── .env yükle (varsa) ──────────────────────────────────────────────────────
-dotenv_path = find_dotenv(usecwd=True)
-if dotenv_path:
-    load_dotenv(dotenv_path)
-
-# ─── Loglama ─────────────────────────────────────────────────────────────────
-os.makedirs("logs", exist_ok=True)
-log_file = os.path.join("logs", f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.log")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_file, encoding="utf-8"),
-    ],
-)
-log = logging.getLogger("auto")
-
-# ─── Yerel modüller ──────────────────────────────────────────────────────────
+from dotenv import load_dotenv
 from sofascore_wrapper.api import SofascoreAPI
+
 import collector as col
-import writer   as wrt
 import uploader as upl
+import writer as wrt
 
-# ─── Ayarlar (.env veya env var) ─────────────────────────────────────────────
-KAGGLE_USERNAME  = os.getenv("KAGGLE_USERNAME", "")
-KAGGLE_SLUG      = os.getenv("KAGGLE_DATASET_SLUG", "superlig-full-dataset")
-DATA_ROOT        = os.getenv("DATA_ROOT", "./data")
-RUN_LOG_PATH     = os.path.join("logs", "run_history.json")
+load_dotenv()
 
-ALL_MODULES = ["standings", "teams", "matches", "events", "match_stats", "players"]
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+TOP_LEAGUES = {
+    "Premier League": 17,
+    "LaLiga": 8,
+    "Serie A": 23,
+    "Bundesliga": 35,
+    "Ligue 1": 34,
+    "Eredivisie": 37,
+    "Liga Portugal": 238,
+    "Super Lig": 52,
+}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Ana pipeline
-# ══════════════════════════════════════════════════════════════════════════════
-async def run_pipeline(
-    season_arg: str | None,
-    modules: list[str],
-    do_upload: bool,
-    new_dataset: bool,
-):
-    start = datetime.datetime.now()
-    log.info("=" * 60)
-    log.info(f"Pipeline başladı  |  modüller: {modules}")
+def configure_logging(level: str) -> None:
+    logging.basicConfig(level=level.upper(), format=LOG_FORMAT)
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Collect player profiles and league statistics from selected "
+            "SofaScore leagues and optionally upload to Kaggle."
+        )
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="data/top_10",
+        help="Directory for generated CSV files and metadata.",
+    )
+    parser.add_argument(
+        "--league-delay",
+        type=float,
+        default=3.0,
+        help="Delay (in seconds) between league-level requests.",
+    )
+    parser.add_argument(
+        "--max-leagues",
+        type=int,
+        default=0,
+        help="Process only the first N leagues (0 = all leagues).",
+    )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Skip Kaggle upload even when credentials are configured.",
+    )
+    parser.add_argument(
+        "--new-dataset",
+        action="store_true",
+        help="Create a new Kaggle dataset instead of creating a new version.",
+    )
+    parser.add_argument(
+        "--version-notes",
+        default="",
+        help="Custom Kaggle version notes.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
+    return parser.parse_args()
+
+
+def build_version_notes(custom_notes: str) -> str:
+    if custom_notes.strip():
+        return custom_notes.strip()
+    date_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"Automated dataset update ({date_utc})"
+
+
+async def run_pipeline(args: argparse.Namespace) -> bool:
+    log = logging.getLogger("auto")
+    all_profiles, all_stats = [], []
+    kaggle_username = os.getenv("KAGGLE_USERNAME")
+    kaggle_dataset_slug = os.getenv("KAGGLE_DATASET_SLUG")
+
+    selected_leagues = list(TOP_LEAGUES.items())
+    if args.max_leagues > 0:
+        selected_leagues = selected_leagues[: args.max_leagues]
+
+    log.info("Pipeline started for %d leagues.", len(selected_leagues))
     api = SofascoreAPI()
-    counts = {}
-    season = {}
 
     try:
-        # ── Sezon seç ────────────────────────────────────────────────────────
-        season = await col.resolve_season(api, int(season_arg) if season_arg and season_arg.isdigit() else None)
+        for league_name, league_id in selected_leagues:
+            log.info("Collecting league: %s (id=%s)", league_name, league_id)
 
-        # Yıl bazlı seçim (örn: "2024")
-        if season_arg and not season_arg.isdigit():
-            all_seasons = await col.get_all_seasons(api)
-            matches = [s for s in all_seasons if season_arg in s.get("year", "")]
-            if not matches:
-                raise ValueError(f"'{season_arg}' yılı bulunamadı")
-            season = matches[0]
+            season = await col.resolve_season(api, league_id)
+            season_id = season.get("id") if isinstance(season, dict) else None
+            if not season_id:
+                log.warning("Skipping %s because no active season was resolved.", league_name)
+                continue
 
-        sid      = season["id"]
-        yr       = season.get("year", str(sid)).replace("/", "-")
-        out_dir  = os.path.join(DATA_ROOT, yr)
-        os.makedirs(out_dir, exist_ok=True)
-
-        log.info(f"Sezon: {season.get('name')}  (id={sid})")
-        log.info(f"Çıktı: {out_dir}")
-
-        # ── Her zaman standings çek (takım ID listesi lazım) ─────────────────
-        standings_rows = await col.collect_standings(api, sid)
-        counts["standings"] = wrt.write_csv(
-            os.path.join(out_dir, "standings.csv"),
-            standings_rows, wrt.SCHEMAS["standings"],
-        )
-        team_ids = [r["team_id"] for r in standings_rows if r.get("team_id")]
-
-        # ── Seçili modülleri çalıştır ────────────────────────────────────────
-        played_ids = []
-
-        if "matches" in modules or "events" in modules or "match_stats" in modules:
-            match_rows, played_ids = await col.collect_matches(api, sid)
-            counts["matches"] = wrt.write_csv(
-                os.path.join(out_dir, "matches.csv"),
-                match_rows, wrt.SCHEMAS["matches"],
+            profiles, stats = await col.collect_players_for_league(
+                api=api,
+                league_id=league_id,
+                season_id=season_id,
+                league_name=league_name,
+            )
+            all_profiles.extend(profiles)
+            all_stats.extend(stats)
+            log.info(
+                "Completed league: %s | profiles=%d | stats=%d",
+                league_name,
+                len(profiles),
+                len(stats),
             )
 
-        if "teams" in modules:
-            profiles, team_stats = await col.collect_teams(api, sid, team_ids)
-            counts["teams"]      = wrt.write_csv(os.path.join(out_dir, "teams.csv"),      profiles,   wrt.SCHEMAS["teams"])
-            counts["team_stats"] = wrt.write_csv(os.path.join(out_dir, "team_stats.csv"), team_stats, wrt.SCHEMAS["team_stats"])
-
-        if "events" in modules and played_ids:
-            goals, cards, subs = await col.collect_events(api, played_ids)
-            counts["goals"]         = wrt.write_csv(os.path.join(out_dir, "goals.csv"),         goals, wrt.SCHEMAS["goals"])
-            counts["cards"]         = wrt.write_csv(os.path.join(out_dir, "cards.csv"),         cards, wrt.SCHEMAS["cards"])
-            counts["substitutions"] = wrt.write_csv(os.path.join(out_dir, "substitutions.csv"), subs,  wrt.SCHEMAS["substitutions"])
-
-        if "match_stats" in modules and played_ids:
-            ms_rows = await col.collect_match_stats(api, played_ids)
-            counts["match_stats"] = wrt.write_csv(os.path.join(out_dir, "match_stats.csv"), ms_rows)
-
-        if "players" in modules:
-            p_profiles, p_stats = await col.collect_players(api, sid, team_ids)
-            counts["player_profiles"] = wrt.write_csv(os.path.join(out_dir, "player_profiles.csv"), p_profiles, wrt.SCHEMAS["player_profiles"])
-            counts["player_stats"]    = wrt.write_csv(os.path.join(out_dir, "player_stats.csv"),    p_stats,    wrt.SCHEMAS["player_stats"])
-
-        # ── Kaggle metadata ──────────────────────────────────────────────────
-        wrt.write_kaggle_metadata(
-            out_dir,
-            kaggle_username=KAGGLE_USERNAME or "your_username",
-            dataset_slug=KAGGLE_SLUG,
-            season_name=season.get("name", yr),
-            row_counts=counts,
-        )
-
-        # ── Özet ─────────────────────────────────────────────────────────────
-        elapsed = (datetime.datetime.now() - start).seconds
-        total   = sum(counts.values())
-        log.info(f"\n{'─'*50}")
-        log.info(f"✅ Tamamlandı  |  {total:,} satır  |  {elapsed}s")
-        for name, cnt in counts.items():
-            log.info(f"   {name:<22} {cnt:>7,} satır")
-        log.info(f"{'─'*50}")
-
-        # ── Kaggle yükleme ────────────────────────────────────────────────────
-        upload_ok = False
-        if do_upload:
-            if not KAGGLE_USERNAME:
-                log.error("KAGGLE_USERNAME tanımlı değil! .env dosyasına ekleyin.")
-            else:
-                version_notes = (
-                    f"Auto-update {datetime.datetime.utcnow():%Y-%m-%d %H:%M UTC} "
-                    f"— {season.get('name')} — {total:,} rows"
-                )
-                # İlk kez mi yoksa güncelleme mi?
-                exists = upl.check_dataset_exists(KAGGLE_USERNAME, KAGGLE_SLUG)
-                upload_ok = upl.upload_dataset(
-                    dataset_dir=out_dir,
-                    username=KAGGLE_USERNAME,
-                    slug=KAGGLE_SLUG,
-                    version_notes=version_notes,
-                    new_dataset=(new_dataset or not exists),
-                )
-
-        # ── Log kaydet ────────────────────────────────────────────────────────
-        wrt.write_run_log(RUN_LOG_PATH, season, counts, "success" if not do_upload or upload_ok else "upload_failed")
-        return True
-
-    except Exception as ex:
-        log.exception(f"Pipeline hatası: {ex}")
-        wrt.write_run_log(RUN_LOG_PATH, season, counts, "error", str(ex))
-        return False
-
+            if args.league_delay > 0:
+                await asyncio.sleep(args.league_delay)
     finally:
         await api.close()
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    wrt.write_csv(
+        os.path.join(args.output_dir, "all_player_profiles.csv"),
+        all_profiles,
+        wrt.SCHEMAS["all_player_profiles"],
+    )
+    wrt.write_csv(
+        os.path.join(args.output_dir, "all_player_stats.csv"),
+        all_stats,
+        wrt.SCHEMAS["all_player_stats"],
+    )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════════════════════
-def main():
-    parser = argparse.ArgumentParser(
-        description="Trendyol Süper Lig Otonom Dataset Sistemi",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "--season",
-        help="Sezon yılı (2024) veya ID (61627). Boş = mevcut sezon.",
-    )
-    parser.add_argument(
-        "--modules", nargs="+",
-        choices=ALL_MODULES,
-        default=ALL_MODULES,
-        help="Çalıştırılacak modüller (varsayılan: hepsi)",
-    )
-    parser.add_argument(
-        "--upload", action="store_true",
-        help="Bitince Kaggle'a yükle",
-    )
-    parser.add_argument(
-        "--new", action="store_true",
-        help="Kaggle'da yeni dataset oluştur (güncelleme yerine)",
-    )
-    parser.add_argument(
-        "--list-seasons", action="store_true",
-        help="Mevcut sezonları listele ve çık",
-    )
-    args = parser.parse_args()
+    has_dataset_identity = bool(kaggle_username and kaggle_dataset_slug)
+    if has_dataset_identity:
+        wrt.write_kaggle_metadata(
+            out_dir=args.output_dir,
+            kaggle_username=kaggle_username,
+            dataset_slug=kaggle_dataset_slug,
+            row_counts={
+                "all_player_profiles": len(all_profiles),
+                "all_player_stats": len(all_stats),
+            },
+            league_names=list(TOP_LEAGUES.keys()),
+        )
+    else:
+        log.warning(
+            "KAGGLE_USERNAME or KAGGLE_DATASET_SLUG is missing; metadata and upload are skipped."
+        )
 
-    # ── Sezon listesi ─────────────────────────────────────────────────────────
-    if args.list_seasons:
-        async def _list():
-            api = SofascoreAPI()
-            try:
-                seasons = await col.get_all_seasons(api)
-                print(f"\n{'ID':>8}  {'Yıl':<10}  Ad")
-                print("-" * 40)
-                for s in seasons:
-                    print(f"{s['id']:>8}  {s.get('year','?'):<10}  {s.get('name','?')}")
-            finally:
-                await api.close()
-        asyncio.run(_list())
-        return
+    if args.no_upload:
+        log.info("Upload skipped by --no-upload flag.")
+        return True
 
-    # ── Pipeline ─────────────────────────────────────────────────────────────
-    ok = asyncio.run(run_pipeline(
-        season_arg=args.season,
-        modules=args.modules,
-        do_upload=args.upload,
-        new_dataset=args.new,
-    ))
-    sys.exit(0 if ok else 1)
+    if not has_dataset_identity:
+        log.info("Upload skipped because Kaggle dataset identity is not configured.")
+        return True
+
+    upload_ok = upl.upload_dataset(
+        dataset_dir=args.output_dir,
+        username=kaggle_username,
+        slug=kaggle_dataset_slug,
+        version_notes=build_version_notes(args.version_notes),
+        new_dataset=args.new_dataset,
+    )
+    if not upload_ok:
+        log.error("Kaggle upload failed.")
+        return False
+
+    log.info("Pipeline finished successfully.")
+    return True
+
+
+def main() -> int:
+    args = parse_args()
+    configure_logging(args.log_level)
+    success = asyncio.run(run_pipeline(args))
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
