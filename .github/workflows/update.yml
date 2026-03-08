@@ -35,6 +35,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Validate required secrets
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_DATASET_SLUG: ${{ secrets.KAGGLE_DATASET_SLUG }}
+        run: |
+          test -n "$KAGGLE_USERNAME" || { echo "Missing secret: KAGGLE_USERNAME"; exit 1; }
+          test -n "$KAGGLE_KEY" || { echo "Missing secret: KAGGLE_KEY"; exit 1; }
+          test -n "$KAGGLE_DATASET_SLUG" || { echo "Missing secret: KAGGLE_DATASET_SLUG"; exit 1; }
 
       - name: Run data collection and upload
         env:
