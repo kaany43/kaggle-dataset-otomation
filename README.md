@@ -92,7 +92,7 @@ The workflow file is:
 
 - `.github/workflows/update.yml`
 
-It runs daily at `04:00 UTC` and can also be started manually with optional inputs.
+It runs weekly on Monday at `04:00 UTC` and can also be started manually with optional inputs.
 
 Required repository secrets:
 
@@ -103,7 +103,7 @@ Required repository secrets:
 ### First publish vs updates
 
 - First publish: run workflow manually with `new_dataset=true`
-- Daily updates: keep `new_dataset=false` (default)
+- Weekly updates: keep `new_dataset=false` (default)
 
 ## Output files
 

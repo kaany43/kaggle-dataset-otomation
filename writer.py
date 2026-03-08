@@ -38,18 +38,22 @@ SCHEMAS = {
 
 
 def write_csv(path: str, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> int:
-    if not rows:
-        log.warning("Skipping empty dataset: %s", path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if not rows and not fieldnames:
+        log.warning("Skipping empty dataset without schema: %s", path)
         return 0
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     if fieldnames is None:
         fieldnames = list(dict.fromkeys(key for row in rows for key in row.keys()))
 
     with open(path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        if rows:
+            writer.writerows(rows)
+        else:
+            log.warning("Wrote header-only CSV because dataset is empty: %s", path)
 
     log.info("Wrote %s with %d rows.", os.path.basename(path), len(rows))
     return len(rows)

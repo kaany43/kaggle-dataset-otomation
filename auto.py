@@ -100,19 +100,23 @@ async def run_pipeline(args: argparse.Namespace) -> bool:
     try:
         for league_name, league_id in selected_leagues:
             log.info("Collecting league: %s (id=%s)", league_name, league_id)
+            try:
+                season = await col.resolve_season(api, league_id)
+                season_id = season.get("id") if isinstance(season, dict) else None
+                if not season_id:
+                    log.warning("Skipping %s because no active season was resolved.", league_name)
+                    continue
 
-            season = await col.resolve_season(api, league_id)
-            season_id = season.get("id") if isinstance(season, dict) else None
-            if not season_id:
-                log.warning("Skipping %s because no active season was resolved.", league_name)
+                profiles, stats = await col.collect_players_for_league(
+                    api=api,
+                    league_id=league_id,
+                    season_id=season_id,
+                    league_name=league_name,
+                )
+            except Exception as exc:
+                log.exception("League failed: %s (id=%s): %s", league_name, league_id, exc)
                 continue
 
-            profiles, stats = await col.collect_players_for_league(
-                api=api,
-                league_id=league_id,
-                season_id=season_id,
-                league_name=league_name,
-            )
             all_profiles.extend(profiles)
             all_stats.extend(stats)
             log.info(
@@ -126,6 +130,10 @@ async def run_pipeline(args: argparse.Namespace) -> bool:
                 await asyncio.sleep(args.league_delay)
     finally:
         await api.close()
+
+    if not all_profiles and not all_stats:
+        log.error("No data was collected from any league. Aborting run.")
+        return False
 
     os.makedirs(args.output_dir, exist_ok=True)
     wrt.write_csv(
@@ -149,7 +157,7 @@ async def run_pipeline(args: argparse.Namespace) -> bool:
                 "all_player_profiles": len(all_profiles),
                 "all_player_stats": len(all_stats),
             },
-            league_names=list(TOP_LEAGUES.keys()),
+            league_names=[name for name, _ in selected_leagues],
         )
     else:
         log.warning(
