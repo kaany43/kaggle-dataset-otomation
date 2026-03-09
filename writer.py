@@ -7,6 +7,20 @@ from typing import Any, Iterable
 
 log = logging.getLogger("writer")
 
+DISCLAIMER_NOTICE = (
+    "## Disclaimer & Copyright Notice\n"
+    "This dataset was collected via an unofficial Python wrapper "
+    "(`sofascore-wrapper`) strictly for educational, research, and non-commercial "
+    "portfolio purposes. All data, including player statistics, market values, and "
+    "performance metrics, are the exclusive property of SofaScore and their "
+    "respective official data providers.\n\n"
+    "I do not own the rights to this data, nor do I claim any ownership. If you are "
+    "the copyright holder and wish for this dataset to be removed, please contact me "
+    "or Kaggle directly, and it will be taken down immediately. Users of this dataset "
+    "are strongly advised to adhere to SofaScore's Terms of Service and use the data "
+    "solely for non-commercial, academic, or personal learning projects."
+)
+
 SCHEMAS = {
     "all_player_profiles": [
         "player_id",
@@ -79,7 +93,8 @@ def build_dataset_description(
         "- `all_player_stats.csv`: Season metrics including goals, assists, xG, xA, "
         "rating, and defensive stats.\n\n"
         f"## Covered Leagues\n{leagues}\n\n"
-        "Source: SofaScore public endpoints via `sofascore-wrapper`."
+        "Source: SofaScore public endpoints via `sofascore-wrapper`.\n\n"
+        f"{DISCLAIMER_NOTICE}"
     )
 
 
